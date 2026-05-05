@@ -1,0 +1,5 @@
+# Minimal requirements for a notebook-first OpenBIM prototype
+jupyterlab>=4.0
+ifcopenshell>=0.8
+bcf-client>=0.8
+ipywidgets>=8.0
