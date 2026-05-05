@@ -1,4 +1,8 @@
-"""Notebook viewer adapter for IFC PoC rendering/highlighting."""
+"""Notebook viewer adapter for IFC PoC rendering/highlighting.
+
+This module prefers `ifc-viewer-anywidget` when available and falls back to
+`ifcopenshell.geom` + `pythreejs` for basic visualization and GUID highlighting.
+"""
 
 from __future__ import annotations
 
@@ -11,98 +15,18 @@ import ifcopenshell
 
 @dataclass
 class ViewerCapabilities:
+    """Runtime capability flags for selected viewer backend."""
+
     backend: str
     can_render: bool
     can_highlight_guid: bool
 
 
-class FallbackIFCViewer:
-    """Minimal pythreejs-based IFC viewer with GUID highlighting."""
-
-    def __init__(self, ifc_path: str | Path, max_elements: int = 200) -> None:
-        self.ifc_path = Path(ifc_path)
-        self.max_elements = max_elements
-        self.guid_to_mesh: dict[str, Any] = {}
-        self._default_color = "#9fa8b3"
-        self._highlight_color = "#e53935"
-        self.renderer = self._build_scene()
-
-    def _build_scene(self) -> Any:
-        import numpy as np
-        import pythreejs as p3
-
-        model = ifcopenshell.open(str(self.ifc_path))
-        settings = ifcopenshell.geom.settings()
-        settings.set(settings.USE_WORLD_COORDS, True)
-
-        meshes: list[Any] = []
-        count = 0
-
-        for product in model.by_type("IfcProduct"):
-            if count >= self.max_elements:
-                break
-            if not getattr(product, "Representation", None):
-                continue
-            guid = getattr(product, "GlobalId", None)
-            if not guid:
-                continue
-
-            try:
-                shape = ifcopenshell.geom.create_shape(settings, product)
-                verts = np.array(shape.geometry.verts, dtype=float).reshape((-1, 3))
-                faces = np.array(shape.geometry.faces, dtype=int).reshape((-1, 3))
-            except Exception:
-                continue
-
-            geometry = p3.BufferGeometry(
-                attributes={
-                    "position": p3.BufferAttribute(verts, normalized=False),
-                    "index": p3.BufferAttribute(faces.ravel(), normalized=False),
-                }
-            )
-            material = p3.MeshLambertMaterial(color=self._default_color, side="DoubleSide")
-            mesh = p3.Mesh(geometry=geometry, material=material)
-
-            meshes.append(mesh)
-            self.guid_to_mesh[guid] = mesh
-            count += 1
-
-        scene = p3.Scene(children=[*meshes, p3.AmbientLight(intensity=0.7)])
-        camera = p3.PerspectiveCamera(position=[10, 10, 10], up=[0, 0, 1])
-        controls = p3.OrbitControls(controlling=camera)
-        return p3.Renderer(
-            camera=camera,
-            scene=scene,
-            controls=[controls],
-            width=900,
-            height=600,
-            antialias=True,
-        )
-
-    def clear_highlight(self) -> None:
-        for mesh in self.guid_to_mesh.values():
-            mesh.material.color = self._default_color
-
-    def highlight_guid(self, guid: str) -> None:
-        self.clear_highlight()
-        mesh = self.guid_to_mesh.get(guid)
-        if mesh is not None:
-            mesh.material.color = self._highlight_color
-
-    def highlight_guids(self, guids: list[str]) -> None:
-        self.clear_highlight()
-        for guid in guids:
-            mesh = self.guid_to_mesh.get(guid)
-            if mesh is not None:
-                mesh.material.color = self._highlight_color
-
-
 class IFCViewerAdapter:
-    def __init__(self, max_elements: int = 200) -> None:
-        self.max_elements = max_elements
-        self._anywidget_viewer_cls = self._detect_anywidget_backend()
-        self.viewer: Any | None = None
-        self._active_backend = "none"
+    """Adapter with a best-effort backend selection for notebook IFC display."""
+
+    def __init__(self) -> None:
+        self._viewer_backend = self._detect_anywidget_backend()
 
     @staticmethod
     def _detect_anywidget_backend() -> Any | None:
@@ -114,38 +38,83 @@ class IFCViewerAdapter:
             return None
 
     def capabilities(self) -> ViewerCapabilities:
+        if self._viewer_backend is not None:
+            return ViewerCapabilities(
+                backend="ifc-viewer-anywidget",
+                can_render=True,
+                can_highlight_guid=False,
+            )
         return ViewerCapabilities(
-            backend=self._active_backend,
-            can_render=self.viewer is not None,
-            can_highlight_guid=bool(self.viewer is not None and hasattr(self.viewer, "highlight_guids")),
+            backend="ifcopenshell-geom+pythreejs",
+            can_render=True,
+            can_highlight_guid=True,
         )
 
     def show(self, ifc_path: str | Path) -> Any:
+        """Return a displayable notebook widget/object for an IFC model."""
         ifc_path = Path(ifc_path)
+        if self._viewer_backend is not None:
+            viewer = self._viewer_backend()
+            viewer.load_ifc(str(ifc_path))
+            return viewer
+        return self._build_fallback_scene(ifc_path)
 
-        if self._anywidget_viewer_cls is not None:
+    def highlight_guid(self, ifc_path: str | Path, guid: str) -> Any:
+        """Return a displayable object with one GUID highlighted (fallback path)."""
+        ifc_path = Path(ifc_path)
+        if self._viewer_backend is not None:
+            raise NotImplementedError(
+                "GUID highlighting via ifc-viewer-anywidget is currently not guaranteed. "
+                "Use fallback backend."
+            )
+        return self._build_fallback_scene(ifc_path, highlighted_guid=guid)
+
+    def _build_fallback_scene(
+        self, ifc_path: Path, highlighted_guid: str | None = None
+    ) -> Any:
+        """Build a minimal pythreejs scene using ifcopenshell.geom meshes."""
+        import numpy as np
+        import pythreejs as p3
+
+        model = ifcopenshell.open(str(ifc_path))
+        settings = ifcopenshell.geom.settings()
+        settings.set(settings.USE_WORLD_COORDS, True)
+
+        groups: list[p3.Mesh] = []
+        default_color = "#9fa8b3"
+        highlight_color = "#e53935"
+
+        for product in model.by_type("IfcProduct"):
+            if not getattr(product, "Representation", None):
+                continue
             try:
-                any_viewer = self._anywidget_viewer_cls()
-                any_viewer.load_ifc(str(ifc_path))
-                if hasattr(any_viewer, "highlight_guids"):
-                    self.viewer = any_viewer
-                    self._active_backend = "ifc-viewer-anywidget"
-                    return self.viewer
+                shape = ifcopenshell.geom.create_shape(settings, product)
             except Exception:
-                pass
+                continue
 
-        self.viewer = FallbackIFCViewer(ifc_path=ifc_path, max_elements=self.max_elements)
-        self._active_backend = "ifcopenshell-geom+pythreejs"
-        return self.viewer.renderer
+            verts = np.array(shape.geometry.verts, dtype=float).reshape((-1, 3))
+            faces = np.array(shape.geometry.faces, dtype=int).reshape((-1, 3))
 
-    def clear_highlight(self) -> None:
-        if self.viewer is not None and hasattr(self.viewer, "clear_highlight"):
-            self.viewer.clear_highlight()
+            geometry = p3.BufferGeometry(
+                attributes={
+                    "position": p3.BufferAttribute(verts, normalized=False),
+                    "index": p3.BufferAttribute(faces.ravel(), normalized=False),
+                }
+            )
+            color = highlight_color if product.GlobalId == highlighted_guid else default_color
+            material = p3.MeshLambertMaterial(color=color, side="DoubleSide")
+            mesh = p3.Mesh(geometry=geometry, material=material)
+            groups.append(mesh)
 
-    def highlight_guid(self, guid: str) -> None:
-        if self.viewer is not None and hasattr(self.viewer, "highlight_guid"):
-            self.viewer.highlight_guid(guid)
-
-    def highlight_guids(self, guids: list[str]) -> None:
-        if self.viewer is not None and hasattr(self.viewer, "highlight_guids"):
-            self.viewer.highlight_guids(guids)
+        scene = p3.Scene(children=[*groups, p3.AmbientLight(intensity=0.7)])
+        camera = p3.PerspectiveCamera(position=[10, 10, 10], up=[0, 0, 1])
+        controls = p3.OrbitControls(controlling=camera)
+        renderer = p3.Renderer(
+            camera=camera,
+            scene=scene,
+            controls=[controls],
+            width=900,
+            height=600,
+            antialias=True,
+        )
+        return renderer
