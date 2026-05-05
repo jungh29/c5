@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+.env
+data/*
+!data/.gitkeep
+exports/*
+!exports/.gitkeep
+
+!data/README_PLACEHOLDER.txt
